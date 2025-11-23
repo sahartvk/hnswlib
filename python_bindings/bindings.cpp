@@ -213,6 +213,29 @@ class Index {
           appr_alg->ef_ = ef;
     }
 
+    void set_early_exit_params(
+        bool   enabled,
+        bool   use_gap,
+        bool   use_entropy,
+        bool   use_stability,
+        float  gap_threshold,
+        float  entropy_threshold,
+        float  stability_threshold,
+        size_t monitor_every,
+        size_t min_top_k) 
+    {
+        appr_alg->set_early_exit_params(
+            enabled,
+            use_gap,
+            use_entropy,
+            use_stability,
+            gap_threshold,
+            entropy_threshold,
+            stability_threshold,
+            monitor_every,
+            min_top_k
+        );
+    }
 
     void set_num_threads(int num_threads) {
         this->num_threads_default = num_threads;
@@ -937,6 +960,19 @@ PYBIND11_PLUGIN(hnswlib) {
         .def("get_items", &Index<float>::getData, py::arg("ids") = py::none(), py::arg("return_type") = "numpy")
         .def("get_ids_list", &Index<float>::getIdsList)
         .def("set_ef", &Index<float>::set_ef, py::arg("ef"))
+        .def(
+            "set_early_exit_params",
+            &Index<float>::set_early_exit_params,
+            py::arg("enabled"),
+            py::arg("use_gap")            = true,
+            py::arg("use_entropy")        = true,
+            py::arg("use_stability")      = true,
+            py::arg("gap_threshold")      = 0.25f,
+            py::arg("entropy_threshold")  = 1.0f,
+            py::arg("stability_threshold") = 0.8f,
+            py::arg("monitor_every")      = 16,
+            py::arg("min_top_k")          = 3
+        )
         .def("set_num_threads", &Index<float>::set_num_threads, py::arg("num_threads"))
         .def("index_file_size", &Index<float>::indexFileSize)
         .def("save_index", &Index<float>::saveIndex, py::arg("path_to_index"))
