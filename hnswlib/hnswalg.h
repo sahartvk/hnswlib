@@ -9,6 +9,8 @@
 #include <unordered_set>
 #include <list>
 #include <memory>
+#include <algorithm>
+#include <cmath>
 
 namespace hnswlib {
 typedef unsigned int tableint;
@@ -69,6 +71,34 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
     std::mutex deleted_elements_lock;  // lock for deleted_elements
     std::unordered_set<tableint> deleted_elements;  // contains internal ids of deleted elements
+    
+    // ---------------- Early-exit configuration ----------------
+    struct EarlyExitParams {
+        bool   enabled;
+        bool   use_gap;
+        bool   use_entropy;
+        bool   use_stability;
+        float  gap_threshold;
+        float  entropy_threshold;
+        float  stability_threshold;
+        size_t monitor_every;
+        size_t min_top_k;
+
+        EarlyExitParams()
+            : enabled(false),
+              use_gap(true),
+              use_entropy(true),
+              use_stability(true),
+              gap_threshold(0.25f),
+              entropy_threshold(1.0f),
+              stability_threshold(0.8f),
+              monitor_every(16),
+              min_top_k(3) {}
+    };
+
+    // Global early-exit settings for this index
+    EarlyExitParams ee_params_;
+    // ---------------------------------------------------------
 
 
     HierarchicalNSW(SpaceInterface<dist_t> *s) {
@@ -174,6 +204,28 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         ef_ = ef;
     }
 
+    // Configure early-exit heuristics.
+    // You can enable/disable each heuristic and set thresholds.
+    void set_early_exit_params(
+        bool   enabled,
+        bool   use_gap            = true,
+        bool   use_entropy        = true,
+        bool   use_stability      = true,
+        float  gap_threshold      = 0.25f,
+        float  entropy_threshold  = 1.0f,
+        float  stability_threshold = 0.8f,
+        size_t monitor_every      = 16,
+        size_t min_top_k          = 3) {
+        ee_params_.enabled            = enabled;
+        ee_params_.use_gap            = use_gap;
+        ee_params_.use_entropy        = use_entropy;
+        ee_params_.use_stability      = use_stability;
+        ee_params_.gap_threshold      = gap_threshold;
+        ee_params_.entropy_threshold  = entropy_threshold;
+        ee_params_.stability_threshold = stability_threshold;
+        ee_params_.monitor_every      = monitor_every;
+        ee_params_.min_top_k          = min_top_k;
+    }
 
     inline std::mutex& getLabelOpMutex(labeltype label) const {
         // calculate hash
@@ -304,6 +356,130 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         return top_candidates;
     }
 
+    // Decide whether we can safely early-exit based on current top_candidates.
+    // Uses enabled heuristics: gap, entropy, stability.
+    bool should_early_exit(
+        const std::priority_queue<
+            std::pair<dist_t, tableint>,
+            std::vector<std::pair<dist_t, tableint>>,
+            CompareByFirst> &top_candidates,
+        std::vector<tableint> &prev_top_ids) const {
+        const EarlyExitParams &p = ee_params_;
+        if (!p.enabled) {
+            return false;
+        }
+
+        size_t sz = top_candidates.size();
+        if (sz < p.min_top_k) {
+            return false;
+        }
+
+        // Copy candidates out of the priority_queue
+        std::vector<std::pair<dist_t, tableint>> elems;
+        elems.reserve(sz);
+        auto tmp = top_candidates;
+        while (!tmp.empty()) {
+            elems.push_back(tmp.top());
+            tmp.pop();
+        }
+
+        // Sort by distance ascending (closest first)
+        std::sort(
+            elems.begin(), elems.end(),
+            [](const std::pair<dist_t, tableint> &a,
+               const std::pair<dist_t, tableint> &b) {
+                return a.first < b.first;
+            });
+
+        size_t k = std::min(p.min_top_k, elems.size());
+
+        // Convert distances -> scores (higher is better)
+        std::vector<float> scores(elems.size());
+        for (size_t i = 0; i < elems.size(); ++i) {
+            scores[i] = -static_cast<float>(elems[i].first);
+        }
+
+        // -------- Heuristic 1: score gap --------
+        float gap = 0.0f;
+        if (p.use_gap) {
+            float best = scores[0];
+            float kth  = scores[k - 1];
+            gap = best - kth;
+        }
+
+        // -------- Heuristic 2: entropy --------
+        float entropy = 0.0f;
+        if (p.use_entropy) {
+            float max_score = *std::max_element(scores.begin(), scores.end());
+            std::vector<float> probs(elems.size());
+            float sum_exp = 0.0f;
+            for (size_t i = 0; i < scores.size(); ++i) {
+                float v = std::exp(scores[i] - max_score);
+                probs[i] = v;
+                sum_exp += v;
+            }
+            if (sum_exp > 0.0f) {
+                for (size_t i = 0; i < probs.size(); ++i) {
+                    float p_i = probs[i] / sum_exp;
+                    if (p_i > 0.0f) {
+                        entropy -= p_i * std::log(p_i);
+                    }
+                }
+            }
+        }
+
+        // -------- Heuristic 3: stability of top-K IDs --------
+        bool has_prev = !prev_top_ids.empty();
+        float stability = 0.0f;
+        if (p.use_stability && has_prev) {
+            size_t k_ids = std::min(prev_top_ids.size(), k);
+            std::unordered_set<tableint> prev(
+                prev_top_ids.begin(),
+                prev_top_ids.begin() + k_ids);
+
+            size_t intersection = 0;
+            for (size_t i = 0; i < k; ++i) {
+                if (prev.find(elems[i].second) != prev.end()) {
+                    ++intersection;
+                }
+            }
+            if (k_ids > 0) {
+                stability = static_cast<float>(intersection) /
+                            static_cast<float>(k_ids);
+            }
+        }
+
+        // Update history of top-K IDs
+        prev_top_ids.resize(k);
+        for (size_t i = 0; i < k; ++i) {
+            prev_top_ids[i] = elems[i].second;
+        }
+
+        // Combine enabled heuristics with logical AND
+        bool any_used = false;
+        bool ok = true;
+
+        if (p.use_gap) {
+            any_used = true;
+            if (gap < p.gap_threshold) {
+                ok = false;
+            }
+        }
+        if (p.use_entropy) {
+            any_used = true;
+            if (entropy > p.entropy_threshold) {
+                ok = false;
+            }
+        }
+        if (p.use_stability && has_prev) {
+            any_used = true;
+            if (stability < p.stability_threshold) {
+                ok = false;
+            }
+        }
+
+        return any_used && ok;
+    }
 
     // bare_bone_search means there is no check for deletions and stop condition is ignored in return of extra performance
     template <bool bare_bone_search = true, bool collect_metrics = false>
@@ -338,6 +514,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         }
 
         visited_array[ep_id] = visited_array_tag;
+
+        std::vector<tableint> ee_prev_top_ids;
+        size_t ee_step = 0;
 
         while (!candidate_set.empty()) {
             std::pair<dist_t, tableint> current_node_pair = candidate_set.top();
@@ -430,6 +609,17 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
                         if (!top_candidates.empty())
                             lowerBound = top_candidates.top().first;
+                    }
+                }
+            }
+            
+            // Early-exit monitor: only when enabled, no custom stop_condition,
+            // and after each monitor_every iterations of the outer loop.
+            if (ee_params_.enabled && !stop_condition && ee_params_.monitor_every > 0) {
+                ++ee_step;
+                if (ee_step % ee_params_.monitor_every == 0) {
+                    if (should_early_exit(top_candidates, ee_prev_top_ids)) {
+                        break;
                     }
                 }
             }
