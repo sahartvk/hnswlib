@@ -72,8 +72,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     std::mutex deleted_elements_lock;  // lock for deleted_elements
     std::unordered_set<tableint> deleted_elements;  // contains internal ids of deleted elements
     
-    // ---------------- Early-exit configuration ----------------
+    // ---------------- Early-exit / Adaptive-K configuration ----------------
     struct EarlyExitParams {
+        // Early-exit (inside search loop)
         bool   enabled;
         bool   use_gap;
         bool   use_entropy;
@@ -84,6 +85,12 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         size_t monitor_every;
         size_t min_top_k;
 
+        // Adaptive-K (post-processing on final scores)
+        bool   adaptive_k_enabled;
+        float  adaptive_gap_threshold;   // e.g. 0.15
+        float  adaptive_entropy_guard;   // e.g. 2.0
+        size_t adaptive_min_k;           // e.g. 1
+
         EarlyExitParams()
             : enabled(false),
               use_gap(true),
@@ -93,7 +100,11 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
               entropy_threshold(1.0f),
               stability_threshold(0.8f),
               monitor_every(16),
-              min_top_k(3) {}
+              min_top_k(3),
+              adaptive_k_enabled(false),
+              adaptive_gap_threshold(0.15f),
+              adaptive_entropy_guard(2.0f),
+              adaptive_min_k(1) {}
     };
 
     // Global early-exit settings for this index
@@ -204,28 +215,37 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         ef_ = ef;
     }
 
-    // Configure early-exit heuristics.
-    // You can enable/disable each heuristic and set thresholds.
+    // Configure early-exit and Adaptive-K heuristics.
     void set_early_exit_params(
         bool   enabled,
-        bool   use_gap            = true,
-        bool   use_entropy        = true,
-        bool   use_stability      = true,
-        float  gap_threshold      = 0.25f,
-        float  entropy_threshold  = 1.0f,
+        bool   use_gap             = true,
+        bool   use_entropy         = true,
+        bool   use_stability       = true,
+        float  gap_threshold       = 0.25f,
+        float  entropy_threshold   = 1.0f,
         float  stability_threshold = 0.8f,
-        size_t monitor_every      = 16,
-        size_t min_top_k          = 3) {
-        ee_params_.enabled            = enabled;
-        ee_params_.use_gap            = use_gap;
-        ee_params_.use_entropy        = use_entropy;
-        ee_params_.use_stability      = use_stability;
-        ee_params_.gap_threshold      = gap_threshold;
-        ee_params_.entropy_threshold  = entropy_threshold;
+        size_t monitor_every       = 16,
+        size_t min_top_k           = 3,
+        bool   adaptive_k_enabled  = false,
+        float  adaptive_gap_threshold  = 0.15f,
+        float  adaptive_entropy_guard  = 2.0f,
+        size_t adaptive_min_k          = 1) {
+        ee_params_.enabled             = enabled;
+        ee_params_.use_gap             = use_gap;
+        ee_params_.use_entropy         = use_entropy;
+        ee_params_.use_stability       = use_stability;
+        ee_params_.gap_threshold       = gap_threshold;
+        ee_params_.entropy_threshold   = entropy_threshold;
         ee_params_.stability_threshold = stability_threshold;
-        ee_params_.monitor_every      = monitor_every;
-        ee_params_.min_top_k          = min_top_k;
+        ee_params_.monitor_every       = monitor_every;
+        ee_params_.min_top_k           = min_top_k;
+
+        ee_params_.adaptive_k_enabled     = adaptive_k_enabled;
+        ee_params_.adaptive_gap_threshold = adaptive_gap_threshold;
+        ee_params_.adaptive_entropy_guard = adaptive_entropy_guard;
+        ee_params_.adaptive_min_k         = adaptive_min_k;
     }
+
 
     inline std::mutex& getLabelOpMutex(labeltype label) const {
         // calculate hash
@@ -479,6 +499,160 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         }
 
         return any_used && ok;
+    }
+
+    // =========================================================
+    // Adaptive-K: entropy + gap on final scores
+    // =========================================================
+
+    // Decide dynamic K from a sorted score vector (higher is better).
+    size_t compute_adaptive_k_from_scores(const std::vector<float>& scores) const {
+        const EarlyExitParams& p = ee_params_;
+
+        if (!p.adaptive_k_enabled || scores.empty()) {
+            return scores.size();  // no change
+        }
+
+        size_t n = scores.size();
+        size_t max_k = n;
+        size_t min_k = p.adaptive_min_k;
+        if (min_k == 0) min_k = 1;
+        if (min_k > max_k) min_k = max_k;
+
+        // -------- Entropy over top max_k --------
+        float max_score = scores[0];
+        std::vector<float> exps(max_k);
+        float sum_exp = 0.0f;
+
+        for (size_t i = 0; i < max_k; ++i) {
+            float v = std::exp(scores[i] - max_score);
+            exps[i] = v;
+            sum_exp += v;
+        }
+
+        float entropy = 0.0f;
+        if (sum_exp > 0.0f) {
+            for (size_t i = 0; i < max_k; ++i) {
+                float p_i = exps[i] / sum_exp;
+                if (p_i > 0.0f) {
+                    entropy -= p_i * std::log(p_i);
+                }
+            }
+        }
+
+        // High entropy = ambiguous/complex → keep many neighbors
+        if (entropy > p.adaptive_entropy_guard) {
+            return max_k;
+        }
+
+        // -------- First large gap after min_k-1 --------
+        size_t start_i = (min_k > 0 ? min_k - 1 : 0);
+        for (size_t i = start_i; i + 1 < max_k; ++i) {
+            float gap = scores[i] - scores[i + 1];
+            if (gap > p.adaptive_gap_threshold) {
+                size_t suggested_k = i + 1;
+                if (suggested_k < min_k) suggested_k = min_k;
+                return suggested_k;
+            }
+        }
+
+        // No strong gap found → keep all we considered
+        return max_k;
+    }
+
+    // Adaptive-K nearest neighbors: similar to searchKnn,
+    // but returns a vector with variable K* (per query).
+    std::vector<std::pair<dist_t, labeltype>>
+    adaptiveSearchKnn(const void *query_data, size_t k_max, BaseFilterFunctor* isIdAllowed = nullptr) const {
+        std::vector<std::pair<dist_t, labeltype>> result;
+        if (cur_element_count == 0) {
+            return result;
+        }
+
+        // ---- 1. Greedy descent on upper levels (same as searchKnn) ----
+        tableint currObj = enterpoint_node_;
+        dist_t curdist = fstdistfunc_(query_data, getDataByInternalId(enterpoint_node_), dist_func_param_);
+
+        for (int level = maxlevel_; level > 0; level--) {
+            bool changed = true;
+            while (changed) {
+                changed = false;
+                unsigned int *data = (unsigned int *) get_linklist(currObj, level);
+                int size = getListCount(data);
+                metric_hops++;
+                metric_distance_computations += size;
+
+                tableint *datal = (tableint *) (data + 1);
+                for (int i = 0; i < size; i++) {
+                    tableint cand = datal[i];
+                    if (cand < 0 || cand > max_elements_)
+                        throw std::runtime_error("cand error");
+                    dist_t d = fstdistfunc_(query_data, getDataByInternalId(cand), dist_func_param_);
+                    if (d < curdist) {
+                        curdist = d;
+                        currObj = cand;
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        // ---- 2. Full search on layer 0 (like searchKnn, but we don't truncate by k_max here) ----
+        std::priority_queue<std::pair<dist_t, tableint>,
+                            std::vector<std::pair<dist_t, tableint>>,
+                            CompareByFirst> top_candidates;
+        bool bare_bone_search = !num_deleted_ && !isIdAllowed;
+        if (bare_bone_search) {
+            top_candidates = searchBaseLayerST<true>(
+                currObj, query_data, std::max(ef_, k_max), isIdAllowed);
+        } else {
+            top_candidates = searchBaseLayerST<false>(
+                currObj, query_data, std::max(ef_, k_max), isIdAllowed);
+        }
+
+        size_t sz = top_candidates.size();
+        if (sz == 0) {
+            return result;
+        }
+
+        // ---- 3. Copy to vector and sort by distance ascending ----
+        std::vector<std::pair<dist_t, tableint>> elems;
+        elems.reserve(sz);
+        while (!top_candidates.empty()) {
+            elems.push_back(top_candidates.top());
+            top_candidates.pop();
+        }
+
+        std::sort(
+            elems.begin(), elems.end(),
+            [](const std::pair<dist_t, tableint> &a,
+               const std::pair<dist_t, tableint> &b) {
+                return a.first < b.first;
+            });
+
+        // ---- 4. Build scores = -distance and compute K* ----
+        std::vector<float> scores(elems.size());
+        for (size_t i = 0; i < elems.size(); ++i) {
+            scores[i] = -static_cast<float>(elems[i].first);
+        }
+
+        size_t k_star = compute_adaptive_k_from_scores(scores);
+        if (k_star == 0) {
+            k_star = 1;  // safety
+        }
+        if (k_star > elems.size()) {
+            k_star = elems.size();
+        }
+        if (k_max > 0 && k_star > k_max) {
+            k_star = k_max;
+        }
+
+        // ---- 5. Convert first K* to (dist,label) result ----
+        result.reserve(k_star);
+        for (size_t i = 0; i < k_star; ++i) {
+            result.emplace_back(elems[i].first, getExternalLabel(elems[i].second));
+        }
+        return result;
     }
 
     // bare_bone_search means there is no check for deletions and stop condition is ignored in return of extra performance
