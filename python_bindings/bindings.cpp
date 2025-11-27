@@ -222,7 +222,11 @@ class Index {
         float  entropy_threshold,
         float  stability_threshold,
         size_t monitor_every,
-        size_t min_top_k) 
+        size_t min_top_k,
+        bool   adaptive_k_enabled,
+        float  adaptive_gap_threshold,
+        float  adaptive_entropy_guard,
+        size_t adaptive_min_k) 
     {
         appr_alg->set_early_exit_params(
             enabled,
@@ -233,7 +237,11 @@ class Index {
             entropy_threshold,
             stability_threshold,
             monitor_every,
-            min_top_k
+            min_top_k,
+            adaptive_k_enabled,
+            adaptive_gap_threshold,
+            adaptive_entropy_guard,
+            adaptive_min_k
         );
     }
 
@@ -719,6 +727,51 @@ class Index {
                 free_when_done_d));
     }
 
+    // Adaptive-K query: returns a Python list of (labels_np, distances_np)
+    // for each query, each with variable length K*_i.
+    py::object adaptiveKnnQuery(
+        py::object input,
+        size_t k_max,
+        const std::function<bool(hnswlib::labeltype)>& filter = nullptr) 
+    {
+        py::array_t<dist_t, py::array::c_style | py::array::forcecast> items(input);
+        auto buffer = items.request();
+
+        size_t rows, features;
+        get_input_array_shapes(buffer, &rows, &features);
+
+        if (features != dim)
+            throw std::runtime_error("Wrong dimensionality of the vectors");
+
+        // Prepare Python list of (labels, distances) per query
+        py::list out;
+
+        CustomFilterFunctor idFilter(filter);
+        CustomFilterFunctor* p_idFilter = filter ? &idFilter : nullptr;
+
+        // No multithreading here (simpler, and K small anyway)
+        for (size_t row = 0; row < rows; ++row) {
+            std::vector<std::pair<dist_t, hnswlib::labeltype>> res =
+                appr_alg->adaptiveSearchKnn((void*)items.data(row), k_max, p_idFilter);
+
+            size_t k_star = res.size();
+
+            py::array_t<hnswlib::labeltype> labels_np(k_star);
+            py::array_t<dist_t> distances_np(k_star);
+
+            auto labels_buf = labels_np.mutable_unchecked<1>();
+            auto dists_buf  = distances_np.mutable_unchecked<1>();
+
+            for (size_t i = 0; i < k_star; ++i) {
+                dists_buf(i)  = res[i].first;
+                labels_buf(i) = res[i].second;
+            }
+
+            out.append(py::make_tuple(labels_np, distances_np));
+        }
+
+        return out;
+    }
 
     void markDeleted(size_t label) {
         appr_alg->markDelete(label);
@@ -964,14 +1017,18 @@ PYBIND11_PLUGIN(hnswlib) {
             "set_early_exit_params",
             &Index<float>::set_early_exit_params,
             py::arg("enabled"),
-            py::arg("use_gap")            = true,
-            py::arg("use_entropy")        = true,
-            py::arg("use_stability")      = true,
-            py::arg("gap_threshold")      = 0.25f,
-            py::arg("entropy_threshold")  = 1.0f,
+            py::arg("use_gap")             = true,
+            py::arg("use_entropy")         = true,
+            py::arg("use_stability")       = true,
+            py::arg("gap_threshold")       = 0.25f,
+            py::arg("entropy_threshold")   = 1.0f,
             py::arg("stability_threshold") = 0.8f,
-            py::arg("monitor_every")      = 16,
-            py::arg("min_top_k")          = 3
+            py::arg("monitor_every")       = 16,
+            py::arg("min_top_k")           = 3,
+            py::arg("adaptive_k_enabled")      = false,
+            py::arg("adaptive_gap_threshold")  = 0.15f,
+            py::arg("adaptive_entropy_guard")  = 2.0f,
+            py::arg("adaptive_min_k")          = 1
         )
         .def("set_num_threads", &Index<float>::set_num_threads, py::arg("num_threads"))
         .def("index_file_size", &Index<float>::indexFileSize)
@@ -1033,6 +1090,11 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("data"),
             py::arg("k") = 1,
             py::arg("num_threads") = -1,
+            py::arg("filter") = py::none())
+        .def("adaptive_knn_query",
+            &Index<float>::adaptiveKnnQuery,
+            py::arg("data"),
+            py::arg("k_max"),
             py::arg("filter") = py::none())
         .def("add_items", &BFIndex<float>::addItems, py::arg("data"), py::arg("ids") = py::none())
         .def("delete_vector", &BFIndex<float>::deleteVector, py::arg("label"))
