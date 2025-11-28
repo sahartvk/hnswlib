@@ -759,8 +759,8 @@ class Index {
             py::array_t<hnswlib::labeltype> labels_np(k_star);
             py::array_t<dist_t> distances_np(k_star);
 
-            auto labels_buf = labels_np.mutable_unchecked<1>();
-            auto dists_buf  = distances_np.mutable_unchecked<1>();
+            auto labels_buf = labels_np.template mutable_unchecked<1>();
+            auto dists_buf  = distances_np.template mutable_unchecked<1>();
 
             for (size_t i = 0; i < k_star; ++i) {
                 dists_buf(i)  = res[i].first;
@@ -1004,6 +1004,11 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("k") = 1,
             py::arg("num_threads") = -1,
             py::arg("filter") = py::none())
+        .def("adaptive_knn_query",
+            &Index<float>::adaptiveKnnQuery,
+            py::arg("data"),
+            py::arg("k_max"),
+            py::arg("filter") = py::none())
         .def("add_items",
             &Index<float>::addItems,
             py::arg("data"),
@@ -1090,11 +1095,6 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("data"),
             py::arg("k") = 1,
             py::arg("num_threads") = -1,
-            py::arg("filter") = py::none())
-        .def("adaptive_knn_query",
-            &Index<float>::adaptiveKnnQuery,
-            py::arg("data"),
-            py::arg("k_max"),
             py::arg("filter") = py::none())
         .def("add_items", &BFIndex<float>::addItems, py::arg("data"), py::arg("ids") = py::none())
         .def("delete_vector", &BFIndex<float>::deleteVector, py::arg("label"))
